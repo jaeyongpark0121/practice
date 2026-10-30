@@ -5,7 +5,8 @@ Reads ``work/human/episode_XXXXXX_mhr.npz`` (fit_body_identity.py) and
 translates (identity rotation, scale 1). Each frame's MoGe points go onto the body's scale with
 that frame's body depth ratio, which also cancels MoGe's per-frame scale wobble. A frame's object
 position is the median of its points no deeper than the object itself behind its nearest points,
-so background seen through a thin mask (a pan held edge-on) is left out. The mesh comes from the
+so background seen through a thin mask (a pan held edge-on) is left out. Frames whose mask is
+several times its usual size (spilled onto the table under the object) get no position. The mesh comes from the
 frame with the largest mask and its neighbours, each centred on its frame's position; the visible
 surface is mirrored about its far side along the viewing ray to close the unseen back, then
 voxelised into a closed surface. Translation is the per-frame position, interpolated over frames
@@ -128,6 +129,8 @@ def main() -> None:
     parser.add_argument("--object", type=Path, default=Path("work/object"))
     parser.add_argument("--sigma", type=float, default=2.0, help="Gaussian smoothing of translation, in frames")
     parser.add_argument("--around", type=int, default=2, help="neighbouring frames merged into the mesh")
+    parser.add_argument("--leak", type=float, default=5.0,
+                        help="frames whose mask exceeds this many times the median mask area are left out")
     parser.add_argument("--out", type=Path, default=Path("out/v0"))
     args = parser.parse_args()
 
@@ -142,10 +145,12 @@ def main() -> None:
 
     ratio = np.where(np.isfinite(track["ratio"]), track["ratio"], np.nanmedian(track["ratio"]))
     points, offsets, area = track["points"], track["point_offsets"], track["area"]
-    best = int(np.argmax(area))
+    leaked = area > args.leak * np.median(area[area > 0])  # the mask spilled onto what the object sits on
+    best = int(np.argmax(np.where(leaked, 0, area)))
     depth = points[offsets[best]:offsets[best + 1], 2]
     extent = np.percentile(depth, 90) - np.percentile(depth, 10) + 0.1
     centre = object_centres(points, offsets, extent) * ratio[:, None]
+    centre[leaked] = np.nan
     raw = np.load(args.human / f"{name}.npz")
     hands = hand_positions(raw["verts_cam"], raw["keypoints_2d"], raw["intrinsics"])
     centre, moved = pull_to_hands(centre, hands, raw["intrinsics"], extent * np.median(ratio))
@@ -168,7 +173,7 @@ def main() -> None:
 
     seen = np.isfinite(centre).all(axis=1)
     print(f"{name}: body depth ratio {np.median(ratio):.3f}, object points on {seen.mean():.0%} of frames, "
-          f"{moved.sum()} moved to hand depth, "
+          f"{leaked.sum()} left out as mask spills, {moved.sum()} moved to hand depth, "
           f"mesh from frames {frames[picks].tolist()}: {np.round(mesh.extents * 100).astype(int).tolist()} cm, "
           f"{len(mesh.faces)} faces, watertight {mesh.is_watertight}")
     print(f"object translation acceleration at scored frames: raw {acceleration_cm(filled[:, None], frames, scored):.3f} cm, "

@@ -15,13 +15,15 @@ in this repository.
 
 ## Object (`~/v2d/.venv-obj`: Grounding DINO, SAM 2.1, MoGe-2)
 
-4. `src/run_object.py` boxes the object from the episode's text prompt with Grounding DINO near
-   the person, tracks it with SAM 2.1, and back-projects the mask with MoGe-2. It also stores the
+4. `src/run_object.py` boxes the object with Grounding DINO. It searches a window around the
+   person, first with the object's short name and then with the episode's text prompt, and skips
+   boxes that are furniture or the person. If that finds nothing, it falls back to the whole frame.
+   It tracks the box with SAM 2.1 and back-projects the mask with MoGe-2. It also stores the
    per-frame SAM 3D Body / MoGe depth ratio.
 5. `src/build_episode.py` puts the object on the body's scale and models it as translation only.
    It uses the nearest-depth median of the points, and hand depth when a held thin object shows
-   background. It closes the visible surface into a voxel mesh and writes the kit's episode NPZ
-   and `_object.ply`.
+   background. It skips frames whose mask spilled onto the table under the object. It closes the
+   visible surface into a voxel mesh and writes the kit's episode NPZ and `_object.ply`.
 6. `src/render_check.py` draws the posed mesh and body over frames for a visual check.
 
 Batches: `src/run_all_human.sh`, `src/run_all_object.sh`, launched through

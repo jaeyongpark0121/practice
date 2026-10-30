@@ -2,7 +2,8 @@
 
 Reads the processed frames, person boxes, camera matrix and camera-frame body vertices written by
 run_human.py. Per contiguous stretch of frames, Grounding DINO boxes the object from the episode's
-text prompt (preferring boxes near the person), SAM 2.1 tracks that box as a mask, and MoGe-2 gives
+short name or text prompt in a window around the person, skipping boxes that are furniture or the
+person (preferring boxes near the person), SAM 2.1 tracks that box as a mask, and MoGe-2 gives
 a metric point map per frame with the same field of view. The body's SAM 3D Body depth over its
 MoGe depth is stored per frame, so the object points can be put on the body's scale later. One
 model is loaded at a time. Run inside ~/v2d/.venv-obj:
@@ -55,28 +56,61 @@ def pick_box(boxes: np.ndarray, scores: np.ndarray, person: np.ndarray, shape: t
     return boxes[best], float(scores[best])
 
 
-def find_object(video: Path, parts: list[list[int]], person: dict[int, np.ndarray], prompt: str,
-                tries: int = 10) -> dict[int, tuple[int, np.ndarray, float]]:
-    """Per stretch, keyed by its first frame: the earliest of its first ``tries`` frames where
-    Grounding DINO finds the prompt, as (frame, box, score)."""
+FURNITURE = ("table", "desk", "chair", "stool", "cart")
+DISTRACTORS = "table. desk. chair. tripod. person."
+
+
+def around_person(person: np.ndarray, shape: tuple, scale: float = 2.0) -> tuple[np.ndarray, np.ndarray]:
+    """Corners of the square image window centred on the person box, ``scale`` times its height."""
+    centre, side = (person[:2] + person[2:]) / 2, scale * (person[3] - person[1])
+    low = np.clip(centre - side / 2, 0, None).astype(int)
+    high = np.minimum(centre + side / 2, [shape[1], shape[0]]).astype(int)
+    return low, high
+
+
+def find_object(video: Path, parts: list[list[int]], person: dict[int, np.ndarray], prompts: list[str],
+                tries: int = 10) -> dict[int, tuple[int, np.ndarray, float, int]]:
+    """Per stretch, keyed by its first frame: the object as (frame, box, score, level) from the
+    earliest of its first ``tries`` frames at the lowest level that finds it. Level k < len(prompts)
+    searches prompt k in a window around the person, which keeps small objects large enough to
+    find and far ones out, and drops boxes that are furniture or a person (unless the object is
+    furniture); the last level is the whole frame with the last prompt and no filter."""
     from transformers import AutoModelForZeroShotObjectDetection, AutoProcessor
+
+    from run_human import box_iou
 
     processor = AutoProcessor.from_pretrained(GDINO)
     model = AutoModelForZeroShotObjectDetection.from_pretrained(GDINO).cuda().eval()
+
+    def detect(rgb: np.ndarray, text: str, low=np.zeros(2, int)) -> tuple[np.ndarray, np.ndarray]:
+        inputs = processor(images=rgb, text=text, return_tensors="pt").to("cuda")
+        result = processor.post_process_grounded_object_detection(
+            model(**inputs), inputs.input_ids, threshold=0.25, text_threshold=0.2,
+            target_sizes=[rgb.shape[:2]])[0]
+        return result["boxes"].cpu().numpy() + np.tile(low, 2), result["scores"].cpu().numpy()
+
+    filter_furniture = not any(word in " ".join(prompts) for word in FURNITURE)
     opening = {frame: part[0] for part in parts for frame in part[:tries]}
     found = {}
     with torch.no_grad():
         for index, rgb in iter_frames(video, sorted(opening)):
-            if opening[index] in found:
-                continue
-            inputs = processor(images=rgb, text=prompt, return_tensors="pt").to("cuda")
-            result = processor.post_process_grounded_object_detection(
-                model(**inputs), inputs.input_ids, threshold=0.25, text_threshold=0.2,
-                target_sizes=[rgb.shape[:2]])[0]
-            if len(result["boxes"]):
-                pick = pick_box(result["boxes"].cpu().numpy(), result["scores"].cpu().numpy(), person[index], rgb.shape)
+            start = opening[index]
+            limit = found[start][3] if start in found else len(prompts) + 1
+            low, high = around_person(person[index], rgb.shape)
+            window = np.ascontiguousarray(rgb[low[1]:high[1], low[0]:high[0]])
+            furniture = detect(window, DISTRACTORS, low)[0] if filter_furniture and limit else np.zeros((0, 4))
+            for level in range(limit):
+                if level < len(prompts):
+                    boxes, scores = detect(window, prompts[level], low)
+                    if len(boxes) and len(furniture):
+                        keep = box_iou(boxes, furniture).max(axis=1) < 0.6
+                        boxes, scores = boxes[keep], scores[keep]
+                else:
+                    boxes, scores = detect(rgb, prompts[-1])
+                pick = pick_box(boxes, scores, person[index], rgb.shape) if len(boxes) else None
                 if pick is not None:
-                    found[opening[index]] = (index, *pick)
+                    found[start] = (index, *pick, level)
+                    break
     return found
 
 
@@ -165,26 +199,32 @@ def main() -> None:
     parser.add_argument("--data", type=Path, default=Path("data/track_1"))
     parser.add_argument("--human", type=Path, default=Path("work/human"))
     parser.add_argument("--out", type=Path, default=Path("work/object"))
+    parser.add_argument("--detect-only", action="store_true", help="print the object detections as JSON and stop")
     args = parser.parse_args()
 
     video = args.data / f"videos/chunk-000/observation.images.exo_camera/episode_{args.episode:06d}.mp4"
     meta = {e["episode_index"]: e for e in map(json.loads, (args.data / "meta/episodes_metadata.jsonl").read_text().splitlines())}
-    prompt = meta[args.episode]["object_prompt"].replace("_", " ").strip().lower().rstrip(".") + "."
+    # The object's short name (from the dataset's object id), then the episode's description.
+    prompts = [meta[args.episode][key].replace("_", " ").strip().lower().rstrip(".") + "." for key in ("object", "object_prompt")]
     human = np.load(args.human / f"episode_{args.episode:06d}.npz")
     frames = human["frames"].tolist()
     parts = stretches(frames)
-    print(f"episode {args.episode}: '{prompt}', {len(frames)} frames in {len(parts)} stretches")
+    print(f"episode {args.episode}: {prompts}, {len(frames)} frames in {len(parts)} stretches")
 
     timings = {}
     started = time.time()
-    found = find_object(video, parts, dict(zip(frames, human["boxes"])), prompt)
+    found = find_object(video, parts, dict(zip(frames, human["boxes"])), prompts)
     release()
     timings["find"] = time.time() - started
+    if args.detect_only:
+        print(json.dumps({start: [index, np.round(box).tolist(), round(score, 3), level]
+                          for start, (index, box, score, level) in sorted(found.items())}))
+        return
     print(f"object found in {len(found)} of {len(parts)} stretches, scores "
-          f"{[round(score, 2) for _, _, score in found.values()]}")
+          f"{[round(score, 2) for _, _, score, _ in found.values()]}, levels {[level for *_, level in found.values()]}")
 
     started = time.time()
-    masks = track_object(video, frames, {index: box for index, box, _ in found.values()})
+    masks = track_object(video, frames, {index: box for index, box, *_ in found.values()})
     release()
     timings["track"] = time.time() - started
 
@@ -198,8 +238,8 @@ def main() -> None:
     timings["points"] = time.time() - started
 
     out = args.out / f"episode_{args.episode:06d}.npz"
-    detections = np.array([[start, index, *box, score] for start, (index, box, score) in sorted(found.items())]).reshape(-1, 7)
-    np.savez(out, frames=np.array(frames), prompt=prompt, detections=detections, **measured)
+    detections = np.array([[start, index, *box, score, level] for start, (index, box, score, level) in sorted(found.items())]).reshape(-1, 8)
+    np.savez(out, frames=np.array(frames), prompt=prompts, detections=detections, **measured)
     seen = measured["area"] > 0
     print(f"seconds per frame: { {stage: round(s / len(frames), 2) for stage, s in timings.items()} }, "
           f"total {sum(timings.values()) / 60:.1f} min")
