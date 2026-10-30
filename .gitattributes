@@ -1,0 +1,3 @@
+# Scripts run inside WSL; keep Unix line endings on Windows checkouts.
+*.sh text eol=lf
+*.py text eol=lf
