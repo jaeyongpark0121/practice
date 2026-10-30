@@ -1,0 +1,17 @@
+# Credentials (Kaggle token lives here; never commit)
+.secrets/
+
+# Local environments and caches (wsl/ holds the Ubuntu disk image)
+wsl/
+.venv/
+.uv/
+.hf/
+__pycache__/
+
+# Downloaded inputs, the official kit, weights, and generated outputs
+data/
+kit/
+weights/
+work/
+out/
+submissions/
